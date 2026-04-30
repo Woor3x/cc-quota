@@ -1,0 +1,12 @@
+{
+  "name": "cc-quota",
+  "description": "Personal token quota tracker with auto-stop threshold for Claude Code",
+  "version": "0.1.0",
+  "author": {
+    "name": "Woor3x",
+    "url": "https://github.com/Woor3x/cc-quota"
+  },
+  "homepage": "https://github.com/Woor3x/cc-quota",
+  "repository": "https://github.com/Woor3x/cc-quota.git",
+  "license": "MIT"
+}

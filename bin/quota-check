@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# cc-quota: UserPromptSubmit hook entrypoint.
+#
+# Forwards CC's JSON event to `quota-cli hook`. The CLI handles two flows:
+#   1. Prompts starting with `!quota ...` are intercepted, executed locally,
+#      output is shown via stderr, and the prompt is blocked (zero-LLM).
+#   2. Otherwise, the configured 5h/7d quota is checked and the prompt is
+#      blocked if over the limit.
+#
+# Exit codes: 0 allow, 2 block (CC convention).
+
+set -u
+
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+CLI="${PLUGIN_ROOT}/bin/quota-cli"
+
+# Override escape hatch
+if [[ "${CC_QUOTA_OVERRIDE:-0}" == "1" ]]; then
+    cat >/dev/null
+    exit 0
+fi
+
+python3 "$CLI" hook
+rc=$?
+
+case "$rc" in
+    0|2) exit "$rc" ;;
+    *)
+        echo "cc-quota: hook failed (rc=$rc), allowing prompt." >&2
+        exit 0
+        ;;
+esac

@@ -1,0 +1,693 @@
+#!/usr/bin/env python3
+"""
+cc-quota CLI: scans Claude Code session JSONL files, aggregates token usage
+across rolling 5h / 7d windows, computes USD cost using an embedded model
+price table, gates the UserPromptSubmit hook, and renders a one-line summary
+for the CC statusline.
+
+Subcommands:
+    status            Print today's usage table.
+    used              Print numeric total for today.
+    set KEY=VAL [...] Update config.
+    check             Hook gate (legacy entrypoint; exit 2 if over limit).
+    hook              Combined hook entrypoint:
+                      - parses stdin (UserPromptSubmit JSON)
+                      - intercepts `!quota ...` prompts (zero-LLM)
+                      - else runs quota check
+    statusline        One-line summary for CC statusline.
+
+Stdlib only. No third-party deps.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable
+
+# ---------- paths ----------
+
+HOME = Path.home()
+CONFIG_DIR = HOME / ".claude" / "cc-quota"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+PROJECTS_DIR = HOME / ".claude" / "projects"
+
+DEFAULT_CONFIG = {
+    "limits": {
+        "daily_usd": None,
+    },
+    "warn_at_pct": 70,
+    "on_exceed": "block",
+}
+
+
+# ---------- pricing ----------
+#
+# USD per million tokens. Mirrors LiteLLM / ccusage data for current Claude
+# models. Lookup is by substring of the `model` field in JSONL entries.
+# `cache_creation` is the 5-minute cache write rate; `cache_creation_1h`
+# is the 1-hour write (2x). `cache_read` is the cache hit rate.
+
+PRICES = [
+    # (substring_match, input, output, cache_creation_5m, cache_read, cache_creation_1h)
+    # Opus 4.5+ uses the new lower pricing tier; Opus 4.0 / 4.1 keep legacy rates.
+    ("claude-opus-4-7",      5.00, 25.00,  6.25, 0.50, 10.00),
+    ("claude-opus-4-6",      5.00, 25.00,  6.25, 0.50, 10.00),
+    ("claude-opus-4-5",      5.00, 25.00,  6.25, 0.50, 10.00),
+    ("claude-opus-4-1",     15.00, 75.00, 18.75, 1.50, 30.00),
+    ("claude-opus-4",       15.00, 75.00, 18.75, 1.50, 30.00),
+    ("claude-opus-3",       15.00, 75.00, 18.75, 1.50, 30.00),
+    ("claude-sonnet-4-7",    3.00, 15.00,  3.75, 0.30,  6.00),
+    ("claude-sonnet-4-6",    3.00, 15.00,  3.75, 0.30,  6.00),
+    ("claude-sonnet-4-5",    3.00, 15.00,  3.75, 0.30,  6.00),
+    ("claude-sonnet-4",      3.00, 15.00,  3.75, 0.30,  6.00),
+    ("claude-3-7-sonnet",    3.60, 18.00,  4.50, 0.36,  7.20),
+    ("claude-3-5-sonnet",    3.00, 15.00,  3.75, 0.30,  6.00),
+    ("claude-haiku-4-5",     1.00,  5.00,  1.25, 0.10,  2.00),
+    ("claude-3-5-haiku",     0.80,  4.00,  1.00, 0.08,  1.60),
+    ("claude-3-haiku",       0.25,  1.25, 0.3125, 0.025, 0.625),
+]
+# Fallback when model id is unknown — use Sonnet 4 rates as a sane default.
+DEFAULT_PRICE = (3.00, 15.00, 3.75, 0.30, 6.00)
+
+
+def price_for(model: str) -> tuple[float, float, float, float, float]:
+    if not model:
+        return DEFAULT_PRICE
+    for substr, *rates in PRICES:
+        if substr in model:
+            return tuple(rates)  # type: ignore[return-value]
+    return DEFAULT_PRICE
+
+
+# ---------- usage record ----------
+
+
+@dataclass
+class Usage:
+    input: int = 0
+    output: int = 0
+    cache_creation: int = 0
+    cache_read: int = 0
+    cache_creation_1h: int = 0
+    cost_usd: float = 0.0
+
+    def add(self, other: "Usage") -> None:
+        self.input += other.input
+        self.output += other.output
+        self.cache_creation += other.cache_creation
+        self.cache_read += other.cache_read
+        self.cache_creation_1h += other.cache_creation_1h
+        self.cost_usd += other.cost_usd
+
+    def total_tokens(self) -> int:
+        return (
+            self.input + self.output + self.cache_creation
+            + self.cache_read + self.cache_creation_1h
+        )
+
+    # "rate limit" tokens — what Anthropic's used_percentage counts.
+    def rate_limit_tokens(self) -> int:
+        return (
+            self.input + self.cache_creation
+            + self.cache_read + self.cache_creation_1h
+        )
+
+
+# ---------- config ----------
+
+
+def load_config() -> dict | None:
+    if not CONFIG_PATH.exists():
+        return None
+    try:
+        return json.loads(CONFIG_PATH.read_text())
+    except Exception as e:
+        print(f"cc-quota: failed to read {CONFIG_PATH}: {e}", file=sys.stderr)
+        return None
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def ensure_config() -> dict:
+    cfg = load_config()
+    if cfg is None:
+        cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+        save_config(cfg)
+    return cfg
+
+
+# ---------- JSONL scanning ----------
+
+
+def iter_session_files() -> Iterable[Path]:
+    if not PROJECTS_DIR.exists():
+        return
+    for project in PROJECTS_DIR.iterdir():
+        if not project.is_dir():
+            continue
+        for jsonl in project.glob("*.jsonl"):
+            yield jsonl
+
+
+def parse_timestamp(value: str):
+    if not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def usage_from_entry(entry: dict) -> tuple[datetime | None, Usage | None]:
+    ts = parse_timestamp(entry.get("timestamp", ""))
+    msg = entry.get("message") or {}
+    raw = msg.get("usage") or entry.get("usage") or {}
+    if not isinstance(raw, dict):
+        return ts, None
+    model = msg.get("model") or entry.get("model") or ""
+
+    # Token fields per Anthropic streaming/event schema.
+    inp = int(raw.get("input_tokens") or 0)
+    out = int(raw.get("output_tokens") or 0)
+    cc5 = int(raw.get("cache_creation_input_tokens") or 0)
+    cr = int(raw.get("cache_read_input_tokens") or 0)
+    # Some entries split 5m vs 1h cache create. Use details if present.
+    cc1h = 0
+    cd = raw.get("cache_creation") or {}
+    if isinstance(cd, dict):
+        # When breakdown exists, prefer it over the lump sum.
+        five_m = int(cd.get("ephemeral_5m_input_tokens") or 0)
+        one_h = int(cd.get("ephemeral_1h_input_tokens") or 0)
+        if five_m or one_h:
+            cc5 = five_m
+            cc1h = one_h
+
+    if inp == 0 and out == 0 and cc5 == 0 and cr == 0 and cc1h == 0:
+        return ts, None
+
+    p_inp, p_out, p_cc, p_cr, p_cc1h = price_for(model)
+    cost = (
+        inp * p_inp + out * p_out
+        + cc5 * p_cc + cr * p_cr + cc1h * p_cc1h
+    ) / 1_000_000
+
+    return ts, Usage(
+        input=inp,
+        output=out,
+        cache_creation=cc5,
+        cache_read=cr,
+        cache_creation_1h=cc1h,
+        cost_usd=cost,
+    )
+
+
+def _dedup_key(entry: dict) -> tuple | None:
+    """ccusage-compatible dedup: (message.id, requestId). None = can't dedup."""
+    msg = entry.get("message") or {}
+    mid = msg.get("id")
+    rid = entry.get("requestId") or msg.get("requestId")
+    if mid is None and rid is None:
+        return None
+    return (mid, rid)
+
+
+def today_cutoff() -> datetime:
+    """Local-calendar-day start (00:00 local) as UTC datetime."""
+    now_local = datetime.now().astimezone()
+    midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight_local.astimezone(timezone.utc)
+
+
+def aggregate_today() -> Usage:
+    """Sum usage from local-midnight today (in user's local TZ) to now."""
+    cutoff = today_cutoff()
+    total = Usage()
+    seen: set[tuple] = set()
+    for path in iter_session_files():
+        try:
+            mt = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            if mt < cutoff:
+                continue
+            with path.open("r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ts, usage = usage_from_entry(entry)
+                    if ts is None or usage is None:
+                        continue
+                    if ts < cutoff:
+                        continue
+                    key = _dedup_key(entry)
+                    if key is not None:
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                    total.add(usage)
+        except OSError:
+            continue
+    return total
+
+
+# ---------- formatting ----------
+
+
+def fmt_usd(v: float) -> str:
+    if v >= 1000:
+        return f"${v:,.0f}"
+    if v >= 100:
+        return f"${v:.1f}"
+    return f"${v:.2f}"
+
+
+def bar(pct: float, width: int = 20) -> str:
+    pct = max(0.0, min(100.0, pct))
+    filled = int(round(pct / 100 * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+# ---------- limit resolution ----------
+
+
+def resolve_limit(cfg_limits: dict):
+    """Returns USD limit (float) or None."""
+    val = cfg_limits.get("daily_usd")
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------- commands ----------
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    cfg = ensure_config()
+    limits = cfg.get("limits") or {}
+    warn = int(cfg.get("warn_at_pct") or 70)
+    u = aggregate_today()
+    lim = resolve_limit(limits)
+
+    print("cc-quota status")
+    print("─" * 70)
+
+    label = "today"
+    if lim is not None:
+        pct = (u.cost_usd / lim * 100) if lim else 0
+        flag = "BLOCK" if pct >= 100 else ("warn" if pct >= warn else "ok")
+        print(f"{label:<10} {fmt_usd(u.cost_usd):>10} / {fmt_usd(lim):>10}  ({pct:5.1f}%)  {bar(pct)}  {flag}")
+    else:
+        print(f"{label:<10} {fmt_usd(u.cost_usd):>10} / {'—':>10}  (  n/a)  {bar(0)}  -")
+
+    print()
+    cutoff = today_cutoff()
+    print(f"breakdown (today, since {cutoff.astimezone().strftime('%Y-%m-%d %H:%M %Z')}):")
+    print(f"  input             {u.input:>14,} tok")
+    print(f"  output            {u.output:>14,} tok")
+    print(f"  cache_creation_5m {u.cache_creation:>14,} tok")
+    print(f"  cache_creation_1h {u.cache_creation_1h:>14,} tok")
+    print(f"  cache_read        {u.cache_read:>14,} tok")
+    print(f"  total cost        {fmt_usd(u.cost_usd):>14}")
+    print()
+    print(f"policy: on_exceed={cfg.get('on_exceed', 'block')}, warn_at={warn}%")
+    print(f"config: {CONFIG_PATH}")
+    return 0
+
+
+def cmd_used(args: argparse.Namespace) -> int:
+    u = aggregate_today()
+    if args.raw:
+        if args.metric == "usd":
+            print(f"{u.cost_usd:.6f}")
+        else:
+            print(u.rate_limit_tokens())
+    else:
+        print(f"today: {fmt_usd(u.cost_usd)}  |  rate-limit tokens: {u.rate_limit_tokens():,}")
+    return 0
+
+
+def _coerce(val: str):
+    s = val.strip()
+    if s.lower() in ("null", "none", ""):
+        return None
+    if s.lower() == "true":
+        return True
+    if s.lower() == "false":
+        return False
+    try:
+        if "." in s:
+            return float(s)
+        return int(s)
+    except ValueError:
+        return s
+
+
+SET_KEYS = {
+    "daily_usd": ("limits", "daily_usd"),
+    "warn_at_pct": ("warn_at_pct",),
+    "on_exceed": ("on_exceed",),
+}
+
+
+def cmd_set(args: argparse.Namespace) -> int:
+    cfg = ensure_config()
+    if not args.assignments:
+        print("usage: quota-cli set KEY=VALUE [KEY=VALUE ...]", file=sys.stderr)
+        print("keys: " + ", ".join(SET_KEYS.keys()), file=sys.stderr)
+        return 1
+    for assignment in args.assignments:
+        if "=" not in assignment:
+            print(f"bad assignment: {assignment} (expected KEY=VALUE)", file=sys.stderr)
+            return 1
+        key, _, raw = assignment.partition("=")
+        key = key.strip()
+        if key not in SET_KEYS:
+            print(f"unknown key: {key}. allowed: {', '.join(SET_KEYS)}", file=sys.stderr)
+            return 1
+        value = _coerce(raw)
+        path = SET_KEYS[key]
+        node = cfg
+        for p in path[:-1]:
+            node = node.setdefault(p, {})
+        node[path[-1]] = value
+        print(f"set {key} = {value!r}")
+    save_config(cfg)
+    print(f"wrote {CONFIG_PATH}")
+    return 0
+
+
+# ---------- check / hook ----------
+
+
+def _evaluate(cfg: dict) -> tuple[int, str]:
+    """Returns (exit_code, message). exit 2 = block, 0 = allow."""
+    on_exceed = cfg.get("on_exceed", "block")
+    limits = cfg.get("limits") or {}
+    warn = int(cfg.get("warn_at_pct") or 70)
+
+    lim = resolve_limit(limits)
+    if lim is None:
+        return 0, ""
+
+    u = aggregate_today()
+    cur = u.cost_usd
+    pct = cur / lim * 100 if lim else 0
+    shown = f"today {fmt_usd(cur)}/{fmt_usd(lim)}"
+
+    if pct >= 100:
+        body = f"cc-quota: limit exceeded — {shown} ({pct:.1f}%)"
+        if on_exceed == "block":
+            return 2, (
+                f"\U0001f6d1 {body}. Blocked. Raise limit "
+                f"with `!quota set ...` or wait reset. "
+                f"Override: CC_QUOTA_OVERRIDE=1 claude"
+            )
+        return 0, f"\u26a0\ufe0f  {body}"
+
+    if pct >= warn:
+        return 0, f"cc-quota: nearing limit — {shown} ({pct:.0f}%)"
+    return 0, ""
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    if cfg is None:
+        return 0
+    rc, msg = _evaluate(cfg)
+    if msg:
+        print(msg, file=sys.stderr)
+    return rc
+
+
+_VALID_SUBS = {"status", "set", "used", "statusline", "check"}
+
+
+def _try_intercept(prompt: str) -> list[str] | None:
+    """
+    Returns argv to pass to main() if the prompt should be intercepted, or
+    None to let the prompt continue to the LLM.
+
+    Recognized forms (whitespace-tolerant):
+      !quota                          -> ['status']
+      !quota status                   -> ['status']
+      !quota set k=v                  -> ['set', 'k=v']
+      /cc-quota:status                -> ['status']
+      /cc-quota:set k=v               -> ['set', 'k=v']
+    """
+    p = prompt.strip()
+    if not p:
+        return None
+
+    # !quota prefix
+    if p == "!quota":
+        return ["status"]
+    if p.startswith("!quota") and len(p) > 6 and p[6].isspace():
+        rest = p[6:].strip()
+        return shlex.split(rest) if rest else ["status"]
+
+    # /cc-quota:<sub> [args]
+    if p.startswith("/cc-quota:"):
+        body = p[len("/cc-quota:"):].lstrip()
+        if not body:
+            return ["status"]
+        # First token = subcommand; remainder = args
+        try:
+            tokens = shlex.split(body)
+        except ValueError:
+            return None
+        if not tokens:
+            return ["status"]
+        sub = tokens[0]
+        if sub not in _VALID_SUBS:
+            return None
+        return tokens
+
+    return None
+
+
+def cmd_hook(args: argparse.Namespace) -> int:
+    """
+    UserPromptSubmit hook entrypoint.
+
+    Reads CC's JSON event from stdin. Two responsibilities:
+      1. If the prompt starts with `!quota ...` or `/cc-quota:<sub>`, treat
+         it as a CLI invocation, run it locally, and emit a JSON `block`
+         decision so the prompt is never sent to the LLM. The CLI output is
+         placed in `reason`, which CC shows to the user but does NOT add to
+         conversation context. Zero LLM tokens.
+      2. Otherwise, run the normal quota check. If over limit and policy is
+         `block`, emit the same JSON block decision; else allow.
+    """
+    raw = sys.stdin.read()
+    prompt = ""
+    if raw.strip():
+        try:
+            event = json.loads(raw)
+            prompt = (event.get("prompt") or "").strip()
+        except json.JSONDecodeError:
+            prompt = raw.strip()
+
+    # Local intercept: !quota <args> OR /cc-quota:<sub> [args]
+    intercept_argv = _try_intercept(prompt)
+    if intercept_argv is not None:
+        out = _capture_subcommand(intercept_argv)
+        _emit_block(out or "(no output)")
+        return 0  # JSON `decision: block` is honored only on exit 0
+
+    # Normal gate
+    cfg = load_config()
+    if cfg is None:
+        return 0
+    rc, msg = _evaluate(cfg)
+    if rc == 2:
+        _emit_block(msg or "cc-quota: limit exceeded")
+        return 0  # JSON-driven block; exit 0 required for parsing
+    if msg:
+        # Soft warning — inject into context as additional info, no block.
+        _emit_context(msg)
+    return 0
+
+
+def _emit_block(reason: str) -> None:
+    """Emit a UserPromptSubmit `block` decision with a reason shown to user."""
+    payload = {
+        "decision": "block",
+        "reason": reason,
+    }
+    sys.stdout.write(json.dumps(payload))
+    sys.stdout.flush()
+
+
+def _emit_context(text: str) -> None:
+    """Inject text into context without blocking the prompt."""
+    payload = {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": text,
+        }
+    }
+    sys.stdout.write(json.dumps(payload))
+    sys.stdout.flush()
+
+
+def _capture_subcommand(argv: list[str]) -> str:
+    """Run a quota-cli subcommand in-process and return captured stdout+stderr."""
+    import io
+    import contextlib
+
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+    with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+        try:
+            main(argv)
+        except SystemExit as e:
+            if e.code not in (0, None):
+                err_buf.write(f"\n(exit {e.code})")
+        except Exception as e:
+            err_buf.write(f"cc-quota error: {e}")
+    out = out_buf.getvalue().rstrip()
+    err = err_buf.getvalue().rstrip()
+    if err:
+        return f"{out}\n{err}" if out else err
+    return out
+
+
+# ---------- statusline rendering ----------
+
+# ANSI escape sequences. CC statusline supports them.
+RST = "\x1b[0m"
+DIM = "\x1b[2m"
+BOLD = "\x1b[1m"
+GREEN = "\x1b[38;5;42m"     # mint
+YELLOW = "\x1b[38;5;220m"   # amber
+RED = "\x1b[38;5;203m"      # coral
+GRAY = "\x1b[38;5;245m"
+CYAN = "\x1b[38;5;81m"
+PINK = "\x1b[38;5;213m"
+
+# Eighth-block characters for sub-cell granularity in the bar.
+_EIGHTHS = [" ", "▏", "▎", "▍", "▌", "▋", "▊", "▉"]
+_FULL = "█"
+
+
+def _color_for(pct: float, warn_pct: int) -> str:
+    if pct >= 100:
+        return RED
+    if pct >= warn_pct:
+        return YELLOW
+    return GREEN
+
+
+def _gradient_bar(pct: float, warn_pct: int, width: int = 10) -> str:
+    """High-resolution unicode bar with color matching threshold zone."""
+    pct = max(0.0, min(100.0, pct))
+    units = pct / 100 * width  # fractional cells
+    full = int(units)
+    frac = units - full
+    eighth = _EIGHTHS[int(round(frac * 8))] if full < width else ""
+    bar_filled = _FULL * full + eighth
+    bar_empty = "─" * max(0, width - len(bar_filled))
+    color = _color_for(pct, warn_pct)
+    return f"{color}{bar_filled}{DIM}{bar_empty}{RST}"
+
+
+def cmd_statusline(args: argparse.Namespace) -> int:
+    cfg = load_config() or DEFAULT_CONFIG
+    limits = cfg.get("limits") or {}
+    warn = int(cfg.get("warn_at_pct") or 70)
+    plain = bool(getattr(args, "plain", False)) or os.environ.get("NO_COLOR")
+
+    u = aggregate_today()
+    seg = _statusline_seg("today", u, limits, warn, plain)
+    if plain:
+        sys.stdout.write(f"💰 {seg}")
+    else:
+        sys.stdout.write(f"{PINK}💰{RST} {seg}")
+    return 0
+
+
+def _statusline_seg(
+    label: str, u: Usage, limits: dict, warn_pct: int, plain: bool
+) -> str:
+    lim = resolve_limit(limits)
+
+    if lim is None:
+        cur_s = fmt_usd(u.cost_usd)
+        if plain:
+            return f"{label} {cur_s}"
+        return f"{DIM}{label}{RST} {BOLD}{cur_s}{RST}"
+
+    cur = u.cost_usd
+    cur_s = fmt_usd(cur)
+    lim_s = fmt_usd(lim)
+    pct = cur / lim * 100 if lim else 0
+
+    if plain:
+        bar = "#" * int(pct / 10) + "-" * max(0, 10 - int(pct / 10))
+        return f"{label} {bar} {cur_s}/{lim_s} {pct:.0f}%"
+
+    color = _color_for(pct, warn_pct)
+    bar = _gradient_bar(pct, warn_pct, width=14)
+    return (
+        f"{DIM}{label}{RST} {bar} "
+        f"{BOLD}{color}{cur_s}{RST}{DIM}/{lim_s}{RST} "
+        f"{color}{pct:.0f}%{RST}"
+    )
+
+
+# ---------- main ----------
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="quota-cli", description="cc-quota CLI")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("status", help="Show current usage")
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("used", help="Show 1d usage total")
+    sp.add_argument("--metric", default="usd", choices=["usd", "tokens"])
+    sp.add_argument("--raw", action="store_true")
+    sp.set_defaults(func=cmd_used)
+
+    sp = sub.add_parser("set", help="Set config keys")
+    sp.add_argument("assignments", nargs="*", help="KEY=VALUE pairs")
+    sp.set_defaults(func=cmd_set)
+
+    sp = sub.add_parser("check", help="Hook gate (legacy; exit 2 to block)")
+    sp.set_defaults(func=cmd_check)
+
+    sp = sub.add_parser("hook", help="UserPromptSubmit hook entrypoint")
+    sp.set_defaults(func=cmd_hook)
+
+    sp = sub.add_parser("statusline", help="One-line summary for CC statusline")
+    sp.add_argument("--plain", action="store_true", help="Disable ANSI colors")
+    sp.set_defaults(func=cmd_statusline)
+
+    args = p.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

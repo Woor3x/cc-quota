@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# cc-quota statusline. Reads CC's JSON event from stdin (ignored for now),
+# prints a single line summarizing 5h/7d quota.
+# Designed to be fast: scans only files modified in last 7d and uses a brief
+# 30s cache to avoid hammering disk on every statusline refresh.
+
+set -u
+
+CACHE="${HOME}/.claude/cc-quota/.statusline.cache"
+CACHE_TTL=5
+CLI_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Drain stdin (CC pipes session JSON; we don't use it)
+cat >/dev/null 2>&1 || true
+
+now=$(date +%s)
+if [[ -f "$CACHE" ]]; then
+    cache_mtime=$(stat -c %Y "$CACHE" 2>/dev/null || stat -f %m "$CACHE" 2>/dev/null || echo 0)
+    age=$(( now - cache_mtime ))
+    if (( age < CACHE_TTL )); then
+        cat "$CACHE"
+        exit 0
+    fi
+fi
+
+mkdir -p "$(dirname "$CACHE")"
+out=$(python3 "$CLI_DIR/quota-cli" statusline 2>/dev/null) || out="cc-quota: err"
+printf '%s' "$out" | tee "$CACHE"

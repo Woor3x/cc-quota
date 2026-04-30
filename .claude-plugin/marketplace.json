@@ -1,0 +1,16 @@
+{
+  "name": "cc-quota-marketplace",
+  "owner": {
+    "name": "Woor3x",
+    "url": "https://github.com/Woor3x"
+  },
+  "plugins": [
+    {
+      "name": "cc-quota",
+      "source": "./",
+      "description": "Personal token quota tracker with auto-stop threshold for Claude Code",
+      "version": "0.1.0",
+      "homepage": "https://github.com/Woor3x/cc-quota"
+    }
+  ]
+}
